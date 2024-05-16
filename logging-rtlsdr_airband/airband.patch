@@ -1,0 +1,312 @@
+diff -ruN RTLSDR-Airband-5.0.9/src/config.cpp logging-RTLSDR-Airband-5.0.9/src/config.cpp
+--- RTLSDR-Airband-5.0.9/src/config.cpp	2024-02-05 07:55:37.000000000 +0200
++++ logging-RTLSDR-Airband-5.0.9/src/config.cpp	2024-05-17 00:13:53.819896081 +0300
+@@ -113,6 +113,8 @@
+ 				(bool)(outs[o]["dated_subdirectories"]) : false;
+ 			fdata->suffix = ".mp3";
+ 
++			fdata->file_path_transmission_log = outs[o]["file_path_transmission_log"].c_str();
++
+ 			fdata->continuous = outs[o].exists("continuous") ?
+ 				(bool)(outs[o]["continuous"]) : false;
+ 			fdata->append = (!outs[o].exists("append")) || (bool)(outs[o]["append"]);
+@@ -133,6 +135,18 @@
+ 				}
+ 			}
+ 
++			fdata->add_levels_to_splitfiles = outs[o].exists("add_levels_to_splitfiles") ? (bool)(outs[o]["add_levels_to_splitfiles"]) : false;
++			if (fdata->add_levels_to_splitfiles) {
++				if (parsing_mixers) {
++					cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: add_levels_to_splitfiles is not allowed for mixers\n";
++					error();
++				}
++				if (fdata->continuous) {
++					cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: can't add levels to continuous recordings\n";
++					error();
++				}
++			}
++
+ 		} else if(!strncmp(outs[o]["type"], "rawfile", 7)) {
+ 			if(parsing_mixers) {	// rawfile outputs not allowed for mixers
+ 				cerr<<"Configuration error: mixers.["<<i<<"] outputs["<<o<<"]: rawfile output is not allowed for mixers\n";
+@@ -167,6 +181,13 @@
+ 				cerr<<"Configuration error: devices.["<<i<<"] channels.["<<j<<"] outputs.["<<o<<"]: can't have both continuous and split_on_transmission\n";
+ 				error();
+ 			}
++
++			fdata->add_levels_to_splitfiles = outs[o].exists("add_levels_to_splitfiles") ? (bool)(outs[o]["add_levels_to_splitfiles"]) : false;
++			if (fdata->continuous && fdata->add_levels_to_splitfiles) {
++				cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: can't add levels to continous recordings.\n";
++				error();
++			}
++
+ 		} else if(!strncmp(outs[o]["type"], "mixer", 5)) {
+ 			if(parsing_mixers) {	// mixer outputs not allowed for mixers
+ 				cerr<<"Configuration error: mixers.["<<i<<"] outputs.["<<o<<"]: mixer output is not allowed for mixers\n";
+diff -ruN RTLSDR-Airband-5.0.9/src/output.cpp logging-RTLSDR-Airband-5.0.9/src/output.cpp
+--- RTLSDR-Airband-5.0.9/src/output.cpp	2024-02-05 07:55:37.000000000 +0200
++++ logging-RTLSDR-Airband-5.0.9/src/output.cpp	2024-05-17 00:35:22.250380592 +0300
+@@ -29,6 +29,8 @@
+ #include <vorbis/vorbisenc.h>
+ #include <shout/shout.h>
+ 
++#include <iomanip> // Include <iomanip> for setprecision
++
+ // SHOUTERR_RETRY is available since libshout 2.4.0.
+ // Set it to an impossible value if it's not there.
+ #ifndef SHOUTERR_RETRY
+@@ -307,6 +309,17 @@
+ 	return 0;
+ }
+ 
++
++// Function to replace substring in a string
++void replaceSubstring(std::string& str, const std::string& from, const std::string& to) {
++	size_t start_pos = 0;
++	while((start_pos = str.find(from, start_pos)) != std::string::npos) {
++		str.replace(start_pos, from.length(), to);
++		start_pos += to.length(); // In case 'to' contains 'from', advance start_pos to avoid infinite loop
++	}
++}
++
++
+ static void close_file(channel_t *channel, file_data *fdata) {
+ 	if (!fdata) {
+ 		return;
+@@ -326,6 +339,60 @@
+ 	if (fdata->f) {
+ 		fclose(fdata->f);
+ 		fdata->f = NULL;
++
++		if (fdata->add_levels_to_splitfiles | !fdata->file_path_transmission_log.empty()) {
++			timeval current_time;
++			gettimeofday(&current_time, NULL);
++
++			float avg_level = level_to_dBFS(channel->levels_sum / (float) channel->levels_count);
++			float freq = channel->freqlist[channel->freq_idx].frequency / 1000000.0;
++			float noisefloor = level_to_dBFS(channel->noise_level);
++			float squelch = level_to_dBFS(channel->squelch_level);
++			double duration_sec = delta_sec(&fdata->open_time, &current_time);
++
++			if (!fdata->file_path_transmission_log.empty()) {
++				FILE *trans_log_fp;
++				char line[1024];
++				time_t opentime = fdata->open_time.tv_sec;
++				struct tm *time;
++				if (use_localtime) {
++					time = localtime(&opentime);
++				} else {
++					time = gmtime(&opentime);
++				}
++
++				// this is the transmission log file entry
++				char timestamp[32];
++				strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", time);
++
++				// this is for the transmission log file name
++				char datestr[32];
++				strftime(datestr, sizeof(datestr), "%Y-%m-%d", time);
++
++				// create filename and open the log file.
++				std::string filename = fdata->file_path_transmission_log;
++				replaceSubstring(filename, "DATE", datestr);
++				trans_log_fp = fopen(filename.c_str(), "a");
++
++				if (trans_log_fp != NULL) {
++					sprintf(line, "freq %.3f, duration %.1f s, avg level %.1f dBFS, squelch level %.1f dBFS, noise floor %.1f dBFS\n", freq, duration_sec, avg_level, squelch, noisefloor);
++					fprintf(trans_log_fp, "%s %s", timestamp, line);
++					fclose(trans_log_fp);
++				}
++			}
++
++			if (fdata->add_levels_to_splitfiles) {
++				std::ostringstream stream;
++				stream << std::fixed << std::setprecision(1) << avg_level;
++				std::string numStr = stream.str();
++				replaceSubstring(fdata->file_path, "level", numStr);
++			}
++
++			// reset counters
++			channel->levels_sum = 0;
++			channel->levels_count = 0;
++		}
++
+ 		rename_if_exists(fdata->file_path_tmp.c_str(), fdata->file_path.c_str());
+ 	}
+ 	fdata->file_path.clear();
+@@ -436,6 +503,13 @@
+ 	if (fdata->include_freq) {
+ 		ss << '_' << channel->freqlist[channel->freq_idx].frequency;
+ 	}
++
++	// modify fdata->file_path to contain the signal strength
++	// the "level" is replaced by avg signal strength when squelch closes.
++	if (fdata->add_levels_to_splitfiles) {
++		ss << "_avg" << "level" << "_";
++	}
++
+ 	ss << fdata->suffix;
+ 	fdata->file_path = ss.str();	
+ 
+diff -ruN RTLSDR-Airband-5.0.9/src/rtl_airband.cpp logging-RTLSDR-Airband-5.0.9/src/rtl_airband.cpp
+--- RTLSDR-Airband-5.0.9/src/rtl_airband.cpp	2024-02-05 07:55:37.000000000 +0200
++++ logging-RTLSDR-Airband-5.0.9/src/rtl_airband.cpp	2024-05-17 01:11:38.491807082 +0300
+@@ -65,6 +65,20 @@
+ #include "gperftools/profiler.h"
+ #endif /* WITH_PROFILING */
+ 
++// levelmonitor
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <arpa/inet.h>
++
++int sockfd;
++struct sockaddr_in server_addr;
++int levelmonitor_port;
++char* levelmonitor_host;
++bool levelmonitor = false;
++// /levelmonitor
++
+ using namespace std;
+ using namespace libconfig;
+ 
+@@ -568,6 +582,11 @@
+ 
+ 					// If squelch sees power then do modulation-specific processing
+ 					if (fparms->squelch.should_process_audio()) {
++
++						// these are used to keep track of the average signal level
++						channel->levels_sum += fparms->squelch.signal_level();
++						channel->levels_count++;
++
+ 						if(fparms->modulation == MOD_AM) {
+ 							if( channel->wavein[j] > fparms->squelch.squelch_level() ) {
+ 								fparms->agcavgfast = fparms->agcavgfast * 0.995f + channel->wavein[j] * 0.005f;
+@@ -669,6 +688,41 @@
+ 					fflush(stdout);
+ 				}
+ 
++				// These carry the levels for making the transmission log
++				channel->squelch_level = fparms->squelch.squelch_level();
++				channel->noise_level = fparms->squelch.noise_level();
++
++				// levelmonitor udp thingy
++				if(levelmonitor) {
++					struct timeval te;
++					gettimeofday(&te, NULL);
++					time_t seconds = te.tv_sec;
++					int milliseconds = te.tv_usec / 1000;
++					struct tm *timeinfo = localtime(&seconds);
++					char timestamp[30];
++					strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", timeinfo);
++					sprintf(timestamp + strlen(timestamp), ".%03d", milliseconds);
++
++					char levelmessage[128]; // 128 should be enough
++					sprintf(levelmessage, "%s, %7.3f, %5.1f, %5.1f, %5.1f, %c",
++						timestamp,
++						(fparms->frequency / 1000000.0),
++						level_to_dBFS(fparms->squelch.signal_level()),
++						level_to_dBFS(fparms->squelch.squelch_level()),
++						level_to_dBFS(fparms->squelch.noise_level()),
++						(fparms->squelch.is_open() ? '1' : '0')
++					);
++
++					// Send the message via UDP
++					ssize_t bytes_sent = sendto(sockfd, levelmessage, strlen(levelmessage), 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
++					if (bytes_sent < 0) {
++						perror("sendto");
++						close(sockfd);
++						exit(EXIT_FAILURE);
++					}
++				}
++				// /levelmonitor
++
+ 				if (channel->axcindicate != NO_SIGNAL) {
+ 					channel->freqlist[channel->freq_idx].active_counter++;
+ 				}
+@@ -851,6 +905,18 @@
+ 			alpha = ((int)root["tau"] == 0 ? 0.0f : exp(-1.0f/(WAVE_RATE * 1e-6 * (int)root["tau"])));
+ #endif /* NFM */
+ 
++		levelmonitor = false;
++		if (root.exists("levelmonitor_host")) {
++			levelmonitor_host = strdup(root["levelmonitor_host"]);
++			if (!root.exists("levelmonitor_port")) {
++				cerr << "Configuration error: levelmonitor_host depends on levelmonitor_port, but is not set\n";
++				exit(1);
++			} else {
++				levelmonitor_port = (int) root["levelmonitor_port"];
++				levelmonitor = true;
++			}
++		}
++
+ 		Setting &devs = config.lookup("devices");
+ 		device_count = devs.getLength();
+ 		if (device_count < 1) {
+@@ -966,6 +1032,22 @@
+ 		}
+ 	}
+ 
++	// levelmonitor
++	if(levelmonitor) {
++		log(LOG_INFO, "Opening levelmonitor socket\n");
++
++		sockfd = socket(AF_INET, SOCK_DGRAM, 0);
++		if (sockfd < 0) {
++			perror("socket");
++			exit(EXIT_FAILURE);
++		}
++
++		memset(&server_addr, 0, sizeof(server_addr));
++		server_addr.sin_family = AF_INET;
++		server_addr.sin_port = htons(levelmonitor_port);
++		inet_pton(AF_INET, levelmonitor_host, &server_addr.sin_addr);
++	} // levelmonitor
++
+ 	for (int i = 0; i < mixer_count; i++) {
+ 		if(mixers[i].enabled == false) {
+ 			continue;		// no inputs connected = no need to initialize output
+@@ -1182,6 +1264,11 @@
+ 		}
+ 	}
+ 
++	// levelmonitor
++	log(LOG_INFO, "Closing levelmonitor socket\n");
++	close(sockfd);
++	// /levelmonitor
++
+ 	close_debug();
+ #ifdef WITH_PROFILING
+ 	ProfilerStop();
+diff -ruN RTLSDR-Airband-5.0.9/src/rtl_airband.h logging-RTLSDR-Airband-5.0.9/src/rtl_airband.h
+--- RTLSDR-Airband-5.0.9/src/rtl_airband.h	2024-02-05 07:55:37.000000000 +0200
++++ logging-RTLSDR-Airband-5.0.9/src/rtl_airband.h	2024-05-17 00:35:35.134306326 +0300
+@@ -138,12 +138,14 @@
+ 	bool dated_subdirectories;
+ 	bool continuous;
+ 	bool append;
+-	bool split_on_transmission;
+ 	bool include_freq;
+ 	timeval open_time;
+ 	timeval last_write_time;
+ 	FILE *f;
+ 	enum output_type type;
++	std::string file_path_transmission_log;
++	bool split_on_transmission;
++	bool add_levels_to_splitfiles;
+ };
+ 
+ struct udp_stream_data {
+@@ -258,6 +260,10 @@
+ 	int lowpass;                // lowpass filter cutoff
+ 	lame_t lame;                // Context for LAME MP3 encoding if needed
+ 	unsigned char *lamebuf;		// Buffer used by each lame encode
++	int levels_count;           //add_levels_to_splitfiles and transmission_log
++	double levels_sum;          //add_levels_to_splitfiles and transmission_log
++	float squelch_level;        //transmission_log
++	float noise_level;          //transmission_log
+ };
+ 
+ enum rec_modes { R_MULTICHANNEL, R_SCAN };
