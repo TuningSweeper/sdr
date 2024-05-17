@@ -57,13 +57,13 @@ $ cat txlog-2024-05-16.txt
 Check dependencies at [RTLSDR-Airband wiki](https://github.com/charlie-foxtrot/RTLSDR-Airband/wiki/Installation#local-build)
 
 ```
-wget patch
+wget https://github.com/TuningSweeper/sdr/raw/main/logging-rtlsdr_airband/airband.patch
 wget https://github.com/charlie-foxtrot/RTLSDR-Airband/archive/refs/tags/v5.0.9.tar.gz
 tar xvfz v5.0.9.tar.gz
 cd RTLSDR-Airband-5.0.9/
 patch -p1 < ../airband.patch
 mkdir build
-cmake ../
 cd build
+cmake ../
 make
 ```
